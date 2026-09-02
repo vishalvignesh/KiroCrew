@@ -37,6 +37,7 @@ from kiro_crew.apps.backend import (
     list_app_processes,
     start_app_backend,
     stop_app_backend,
+    stop_recorded_app_backend,
 )
 from kiro_crew.apps.bridges import (
     RegistrationResult,
@@ -1150,6 +1151,40 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
                 status=409,
             )
 
+        # Step 0.5: The recorded backend must be stopped and CONFIRMED before
+        # the destructive steps. Ordered BEFORE cron cleanup: a stop refusal
+        # must abort while the app still owns its scheduled jobs (cron
+        # removal is not restorable). The converse hazard - a later
+        # cron-store 409 leaving the still-enabled app offline - is handled
+        # by that arm RESTARTING the backend it just stopped. In this
+        # (gateway) process the call also performs the tracked teardown, so
+        # the Step 3 stop below is an idempotent no-op.
+        stop_confirmed = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), stop_recorded_app_backend, name
+        )
+        if not stop_confirmed:
+            sel().log_api_access(
+                caller="dashboard",
+                operation="app_uninstall",
+                outcome="denied",
+                resources=f"app={name}",
+                error="backend stop unconfirmed, uninstall aborted",
+            )
+            return web.json_response(
+                {
+                    "error": (
+                        f"not uninstalling {name!r}: its backend is still "
+                        f"running (or its pid record cannot be read) and the "
+                        f"stop could not be confirmed. Nothing has been "
+                        f"changed - stop it and retry."
+                    ),
+                    "code": "backend_stop_unconfirmed",
+                    "retryable": True,
+                    "app": name,
+                },
+                status=409,
+            )
+
         # Step 1: Cron cleanup is the FIRST uninstall precondition, run BEFORE
         # the (possibly destructive, non-idempotent) onUninstall script and
         # BEFORE the backend is stopped. Uninstall is irreversible: below this
@@ -1203,6 +1238,20 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
                         resources=f"app={name}",
                         error=f"cron cleanup failed, uninstall aborted: {exc}",
                     )
+                    # Undo the Step 0.5 stop: the app is still installed and
+                    # enabled, and this abort promises it stays WHOLE - offline
+                    # is not whole. Best-effort; a start failure is the health
+                    # loop's problem, exactly as on any gateway restart.
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(
+                            subprocess_executor(), start_app_backend, name
+                        )
+                    except Exception as _restart_exc:  # noqa: BLE001
+                        logger.warning(
+                            "Could not restart %s backend after aborted uninstall: %s",
+                            name,
+                            _restart_exc,
+                        )
                     return web.json_response(
                         {
                             "error": (
@@ -1240,6 +1289,20 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
                         resources=f"app={name}",
                         error=f"cron store unreadable, uninstall aborted: {exc}",
                     )
+                    # Undo the Step 0.5 stop: the app is still installed and
+                    # enabled, and this abort promises it stays WHOLE - offline
+                    # is not whole. Best-effort; a start failure is the health
+                    # loop's problem, exactly as on any gateway restart.
+                    try:
+                        await asyncio.get_running_loop().run_in_executor(
+                            subprocess_executor(), start_app_backend, name
+                        )
+                    except Exception as _restart_exc:  # noqa: BLE001
+                        logger.warning(
+                            "Could not restart %s backend after aborted uninstall: %s",
+                            name,
+                            _restart_exc,
+                        )
                     return web.json_response(
                         {
                             "error": str(exc),
@@ -2713,11 +2776,7 @@ def _open_ui_file(name: str, file_path: str) -> tuple[int, os.stat_result] | str
         # has no link to refuse. Checked on the DESCRIPTOR, which is what makes
         # it race-free. Inline rather than `pinned_fs.refuse_hardlink_alias`
         # for the same double-close reason `_read_declared_art` documents.
-        if (
-            not stat.S_ISREG(st.st_mode)
-            or st.st_nlink != 1
-            or st.st_size > _UI_MAX_BYTES
-        ):
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > _UI_MAX_BYTES:
             os.close(fd)
             return "not_found"
     except OSError:
