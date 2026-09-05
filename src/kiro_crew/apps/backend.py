@@ -40,6 +40,7 @@ from kiro_crew.sandbox import (
     RLIMIT_PROFILE_BUILD,
     RLIMIT_PROFILE_TOOL,
     cgroup_scope_argv,
+    md_notebook_backend_visible_paths,
     popen_limited,
     run_limited,
     wrap_argv,
@@ -1134,10 +1135,24 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
     # permissions: with ``require_policy_signature`` set in the admission policy, a document
     # nobody trusted is refused however it got onto disk.
     _visible: tuple[str, ...] = ()
-    if _platform_extra.get(POLICY_CACHE_ONLY_ENV):
+    _cache_visible = bool(_platform_extra.get(POLICY_CACHE_ONLY_ENV))
+    if _cache_visible:
         _visible = (str(policy_cache_dir()),)
+    # The md-notebook (Notes) backend is the only legitimate reader AND writer of its own
+    # three state leaves (``workspace/md-notebook/{pat,vaults.json,settings.json}``), yet
+    # those leaves are bind-masked in every sandbox mode so no OTHER sandboxed process can
+    # touch them. This backend is itself spawned inside that sandbox, so it inherits the
+    # mask over its own registry and its atomic rename onto ``vaults.json`` fails with
+    # EPERM. Passing the leaves as ``extra_visible_dirs`` cancels the mask for THIS spawn
+    # only, mirroring the policy-cache carve-out just above -- except these must be
+    # read+write (``sandbox`` seals only the policy cache read-only), because the rename
+    # target has to be writable. The agent-file-tool gate and every other process are
+    # unaffected: this widens nothing beyond this one child. The app-name literal matches
+    # ``apps/builtins/md_notebook/app.json``.
+    if app_name == "md-notebook":
+        _visible = _visible + md_notebook_backend_visible_paths()
     sandboxed_cmd, cleanup_path = wrap_argv(cmd, mode="standard", extra_visible_dirs=_visible)
-    if _visible and list(sandboxed_cmd) == list(cmd):
+    if _cache_visible and list(sandboxed_cmd) == list(cmd):
         # The wrap was a no-op, so this host has no OS confinement at all: no sandbox backend,
         # or agent.sandbox='off' with the sandbox_allow_no_isolation opt-in. Said once,
         # because the combination is worth naming — a centrally governed host running app code

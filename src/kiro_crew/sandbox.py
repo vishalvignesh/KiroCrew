@@ -304,6 +304,48 @@ def _crew_home_entries(leaves: tuple[str, ...]) -> list[str]:
     return [f"{prefix}/{leaf}" for prefix in _CREW_HOME_PREFIXES for leaf in leaves]
 
 
+#: The md-notebook (Notes) app backend's OWN three state leaves.
+#:
+#: These stay in ``_CREW_HIDDEN_LEAVES`` above, so every OTHER sandboxed process still
+#: has them bind-masked, and they stay on ``security``'s agent-file-tool gate, so an
+#: agent still cannot reach them through a file_read/file_write call. The one process
+#: that legitimately reads AND writes them is the md-notebook backend itself: it is
+#: spawned inside the OS sandbox (``apps/backend.py``), and its registry write stages a
+#: sibling temp then atomically renames it onto ``vaults.json`` -- a rename the mask
+#: denies with EPERM. So the backend's own spawn passes these leaves as
+#: ``extra_visible_dirs`` (see :func:`md_notebook_backend_visible_paths`), which cancels
+#: the mask for THAT process only. Unlike the policy cache, they are NOT sealed
+#: read-only: the rename target must be writable. Spelled as a named tuple so the
+#: visible set the backend opens and the hidden set every other process sees stay in
+#: lockstep, and cannot drift apart in a later edit.
+_MD_NOTEBOOK_OWN_STATE_LEAVES: tuple[str, ...] = (
+    "workspace/md-notebook/pat",
+    "workspace/md-notebook/vaults.json",
+    "workspace/md-notebook/settings.json",
+)
+
+
+def md_notebook_backend_visible_paths() -> tuple[str, ...]:
+    """Absolute paths of the md-notebook backend's own state leaves, every spelling.
+
+    Resolved the same way the hidden set is: joined under both ``_CREW_HOME_PREFIXES``
+    over ``$HOME``, plus :func:`_relocated_crew_targets` for a data home moved out from
+    under ``$HOME`` by ``KIROCREW_HOME``. ``apps/backend.py`` passes the result into
+    ``wrap_argv`` as ``extra_visible_dirs`` for the md-notebook spawn, so
+    ``_hidden_path_contains_visible_path`` cancels the bind mask for exactly these leaves
+    and only for that process. Deriving them here keeps ``backend.py`` from restating the
+    path logic and keeps this visible set matched to ``_MD_NOTEBOOK_OWN_STATE_LEAVES``.
+    """
+    home = str(Path.home())
+    paths = [
+        os.path.join(home, f"{prefix}/{leaf}")
+        for prefix in _CREW_HOME_PREFIXES
+        for leaf in _MD_NOTEBOOK_OWN_STATE_LEAVES
+    ]
+    paths.extend(_relocated_crew_targets(_MD_NOTEBOOK_OWN_STATE_LEAVES))
+    return tuple(dict.fromkeys(paths))
+
+
 #: Bind-masked in every mode.
 _CREW_HIDDEN_DIRS: list[str] = _crew_home_entries(_CREW_HIDDEN_LEAVES)
 #: Exposed read-only in every mode.

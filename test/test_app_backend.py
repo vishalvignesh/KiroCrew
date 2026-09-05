@@ -1755,6 +1755,146 @@ class TestTheCacheOnlyChildCanSeeTheCacheItMustBootFrom:
         assert seen.get("visible") == ()
 
 
+class TestTheMdNotebookBackendSeesItsOwnStateLeaves:
+    """The Notes backend is the only legitimate reader AND writer of its own three
+    state leaves (``workspace/md-notebook/{pat,vaults.json,settings.json}``).
+
+    Those leaves are bind-masked in every sandbox tier so no OTHER sandboxed process can
+    touch them, and they stay on the agent-file-tool gate. But this backend is itself
+    spawned inside that sandbox, so without a carve-out it inherits the mask over its own
+    registry and its atomic rename onto ``vaults.json`` fails with EPERM -- attach and
+    clone break, reads silently return ``[]``. The spawn passes these leaves as
+    ``extra_visible_dirs`` so the mask is cancelled for THAT process only, read+write
+    (unlike the policy cache, which is sealed read-only) because the rename target must
+    be writable.
+    """
+
+    @staticmethod
+    def _md_notebook_leaves():
+        from kiro_crew import sandbox
+
+        return set(sandbox.md_notebook_backend_visible_paths())
+
+    def _spawn_and_capture_visible(self, bmod, tmp_path, monkeypatch, app_name):
+        seen: dict = {}
+
+        def _spy_wrap(argv, **kwargs):
+            seen["visible"] = kwargs.get("extra_visible_dirs")
+            return (list(argv), None)
+
+        monkeypatch.setattr(bmod, "wrap_argv", _spy_wrap)
+        monkeypatch.setattr(
+            bmod.subprocess, "Popen", lambda *a, **k: (_ for _ in ()).throw(OSError("stop"))
+        )
+        src = tmp_path / "source" / app_name
+        src.mkdir(parents=True)
+        (src / APP_MANIFEST_FILENAME).write_text(
+            json.dumps(
+                {
+                    "name": app_name,
+                    "version": "1.0.0",
+                    "displayName": app_name,
+                    "description": "md-notebook state-leaf visibility",
+                    "backend": {"entryPoint": "server.py", "healthCheck": "/health"},
+                }
+            )
+        )
+        (src / "server.py").write_text("import time\ntime.sleep(30)\n")
+        install_app(src)
+        bmod.start_app_backend(app_name)
+        return seen
+
+    def test_the_spawn_passes_all_three_leaves_as_visible_dirs(
+        self, app_env, tmp_path, monkeypatch
+    ):
+        import kiro_crew.apps.backend as bmod
+
+        seen = self._spawn_and_capture_visible(bmod, tmp_path, monkeypatch, "md-notebook")
+
+        visible = set(seen.get("visible") or ())
+        missing = self._md_notebook_leaves() - visible
+        assert not missing, (
+            "the md-notebook backend spawn did not expose its own state leaves, so the "
+            f"atomic rename onto vaults.json stays EPERM-denied (missing {missing!r})"
+        )
+
+    def test_another_app_gets_none_of_the_leaves(self, app_env, tmp_path, monkeypatch):
+        """The carve-out is scoped to md-notebook alone: any other backend keeps the mask."""
+        import kiro_crew.apps.backend as bmod
+
+        seen = self._spawn_and_capture_visible(bmod, tmp_path, monkeypatch, "other-app")
+
+        visible = set(seen.get("visible") or ())
+        leaked = self._md_notebook_leaves() & visible
+        assert not leaked, (
+            f"a non-md-notebook backend was handed the Notes state leaves: {leaked!r}"
+        )
+
+    def test_the_leaves_are_exposed_read_write_not_hidden_on_linux(self):
+        """When the leaves are supplied, the launcher DROPS them from the hidden set and
+        does NOT seal them read-only -- contrast the policy cache, which stays read-only.
+        The rename target must be writable for attach/clone to succeed."""
+        from kiro_crew import sandbox
+
+        leaves = sandbox.md_notebook_backend_visible_paths()
+
+        hidden_default = json.loads(
+            sandbox._build_launcher_script("standard").split("SENSITIVE_DIRS = ", 1)[1].split(
+                "\n", 1
+            )[0]
+        )
+        script = sandbox._build_launcher_script("standard", extra_visible_dirs=leaves)
+        hidden = json.loads(script.split("SENSITIVE_DIRS = ", 1)[1].split("\n", 1)[0])
+        readonly = json.loads(script.split("READONLY_DIRS = ", 1)[1].split("\n", 1)[0])
+
+        for leaf in leaves:
+            assert leaf in hidden_default, (
+                f"{leaf} must be masked for every OTHER process by default"
+            )
+            assert leaf not in hidden, f"{leaf} must be un-hidden for the md-notebook spawn"
+            assert leaf not in readonly, (
+                f"{leaf} must be READ+WRITE, not sealed read-only like the policy cache"
+            )
+
+    def test_macos_drops_the_denies_for_the_leaves_when_supplied(self):
+        from kiro_crew import sandbox
+
+        leaves = sandbox.md_notebook_backend_visible_paths()
+
+        default = sandbox._build_seatbelt_profile("standard")
+        exposed = sandbox._build_seatbelt_profile("standard", extra_visible_dirs=leaves)
+        for leaf in leaves:
+            assert f'(deny file-read* (subpath "{leaf}"))' in default, (
+                f"{leaf} must be deny-listed for every other process by default"
+            )
+            assert f'(deny file-read* (subpath "{leaf}"))' not in exposed
+            assert f'(deny file-write* (subpath "{leaf}"))' not in exposed
+            assert f'(deny file-write* (literal "{leaf}"))' not in exposed
+
+    def test_an_unexposed_leaf_stays_hidden_and_denied(self):
+        """The negative: with no md-notebook visible paths, the leaves stay masked."""
+        from kiro_crew import sandbox
+
+        leaves = sandbox.md_notebook_backend_visible_paths()
+
+        script = sandbox._build_launcher_script("standard")
+        hidden = json.loads(script.split("SENSITIVE_DIRS = ", 1)[1].split("\n", 1)[0])
+        profile = sandbox._build_seatbelt_profile("standard")
+        for leaf in leaves:
+            assert leaf in hidden, f"{leaf} must stay hidden for a spawn that does not name it"
+            assert f'(deny file-read* (subpath "{leaf}"))' in profile
+
+    def test_the_agent_file_tool_gate_still_fences_all_three_leaves(self):
+        """The OS carve-out does not touch the SEPARATE agent-file-tool gate: an agent
+        still cannot read or write these paths through a file tool, under either prefix."""
+        from kiro_crew.security import is_sensitive_path
+
+        for prefix in (".kiro/crew", ".kirocrew"):
+            for leaf in ("pat", "vaults.json", "settings.json"):
+                path = f"~/{prefix}/workspace/md-notebook/{leaf}"
+                assert is_sensitive_path(path) is True, f"{path} must stay behind the tool gate"
+
+
 # =============================================================================
 # Post-startup liveness watch (#5726)
 # =============================================================================

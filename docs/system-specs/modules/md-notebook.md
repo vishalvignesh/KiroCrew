@@ -45,6 +45,22 @@ optional `subfolder` scope, plus `knowledge` and `knowledgeSourceId`. The `exter
 returned by `GET /api/vaults` is COMPUTED on read (`localPath` is outside `vaults/`) and
 never persisted.
 
+### These three leaves and the OS sandbox
+
+`pat`, `vaults.json`, and `settings.json` sit in `sandbox._CREW_HIDDEN_LEAVES`, so the OS
+sandbox bind-masks them for every sandboxed process, and they are on the agent-file-tool
+gate (`_SENSITIVE_HOME_DIRS`), so an agent still cannot reach them through a file tool.
+The one process that legitimately reads AND writes them is this backend, which is itself
+spawned inside the sandbox. Its registry write stages a sibling temp file and atomically
+renames it onto `vaults.json`, and the mask denies that rename with `EPERM`, so attach and
+clone would always fail and reads would silently return `[]`. To fix that, the app-backend
+spawn in `apps/backend.py` passes `sandbox.md_notebook_backend_visible_paths()` (both
+crew-home spellings and the relocated data home) as `extra_visible_dirs` for the
+md-notebook backend only. That cancels the mask for these three leaves for that one
+process, read+write. Unlike the policy cache, they are NOT sealed read-only, because the
+rename target has to be writable. Every other sandboxed process keeps the mask, and the
+agent-file-tool gate is untouched.
+
 ## Routes
 
 The gateway proxy preserves the `/api/` prefix, so the backend sees exactly the paths the
