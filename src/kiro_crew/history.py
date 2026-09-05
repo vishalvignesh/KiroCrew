@@ -194,6 +194,11 @@ SLOT_OWNED_META_KEYS: frozenset[str] = frozenset(
         "folder_id",
         "app",
         "artifact",
+        # Orchestrator plan state (stage titles, goal, and the tracker's cap
+        # ledger + per-stage result paths). Slot-owned so absence means CLEARED:
+        # a plan that completed, was cancelled, or was replaced must not be
+        # carried forward and re-offered for resume on the next restart.
+        "plan",
         "pinned",
         "color_index",
         "color_hex",

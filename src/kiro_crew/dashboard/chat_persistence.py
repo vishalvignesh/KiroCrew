@@ -27,6 +27,7 @@ from kiro_crew.config.loader import (
     KiroCrewConfig,
     config_dir,
 )
+from kiro_crew.context_management import OrchestrationTracker
 from kiro_crew.dashboard.channel_slots import slot_closed_since
 from kiro_crew.dashboard.chat_utils import (
     _normalize_model,
@@ -247,6 +248,198 @@ def _validate_autocompact_pct(raw: object) -> float | None:
     if raw is not None:
         logger.warning("Discarding invalid persisted autocompact_pct: %r", raw)
     return None
+
+
+# Marker embedded in the restart-resume row so a second restart on the same
+# unfinished plan does not stack another copy of the offer.
+_PLAN_RESUME_MARKER = "was interrupted when the gateway restarted"
+
+
+def _plan_state_for_save(slot: _ChatSlot) -> dict:
+    """Serialise the slot's live plan state, or ``{}`` when there is none.
+
+    The orchestrator's execution pointer used to be purely in memory:
+    ``_stage_titles``, ``_plan_goal`` and the tracker's round / escalation /
+    result ledger. Stage result FILES survived a restart but nothing said which
+    stage was next, so a gateway restart mid-plan lost the run with no way to
+    resume it (issue #1783).
+
+    ``_auto_run`` is deliberately NOT part of the record. A restart must not
+    resume unattended execution, so nothing would read it back: the resume offer
+    presents Go and Go All identically and the user's click is what re-arms the
+    flag. Persisting it would be a key with no consumer.
+
+    Returns ``{}`` -- i.e. "no plan", which the slot-owned semantics write as a
+    cleared field -- for every state that must NOT be resumed:
+
+    * not an orchestrator slot, or no plan armed yet (no stage titles);
+    * the plan was cancelled (``_plan_cancelled``) or its tracker stopped, which
+      is the same revocation the stage loop's own gates read;
+    * every stage already produced a result, so the plan is finished. Persisting
+      a finished plan would make the next restart re-enter the loop past its last
+      stage and re-emit the completion summary.
+    """
+    if getattr(slot, "mode", "") != "orchestrator":
+        return {}
+    titles = [str(t) for t in (getattr(slot, "_stage_titles", None) or [])]
+    if not titles:
+        return {}
+    if getattr(slot, "_plan_cancelled", False):
+        return {}
+    tracker = getattr(slot, "_orch_tracker", None)
+    snapshot: dict = {}
+    if tracker is not None:
+        if getattr(tracker, "stopped", False):
+            return {}
+        try:
+            snapshot = tracker.snapshot()
+            if tracker.resume_stage() > len(titles):
+                return {}
+        except Exception:
+            logger.debug("Plan snapshot failed for slot %s", slot.key, exc_info=True)
+            snapshot = {}
+    descriptions = [
+        [str(b) for b in (bullets or [])]
+        for bullets in (getattr(slot, "_stage_descriptions", None) or [])
+    ]
+    return {
+        "goal": str(getattr(slot, "_plan_goal", "") or ""),
+        "stage_titles": titles,
+        "stage_descriptions": descriptions,
+        "tracker": snapshot,
+    }
+
+
+def _restore_plan_state(slot: _ChatSlot, raw: object) -> int | None:
+    """Rehydrate plan state onto *slot*. Returns the stage to resume from, or None.
+
+    ``None`` means "nothing to offer": either there was no persisted plan, or the
+    plan was armed but never started, in which case the plan message already in
+    the transcript still carries its own Go buttons and restoring the titles is
+    all that is needed to make them work again.
+
+    ``_auto_run`` is deliberately left alone. A restart must not silently resume
+    unattended execution of a plan the user is not watching, and the offer draws
+    no distinction between Go and Go All, so nothing is stored to re-arm from:
+    re-arming it is the user's click.
+    """
+    if not isinstance(raw, dict) or not raw:
+        return None
+    titles = raw.get("stage_titles")
+    if not isinstance(titles, list) or not titles:
+        return None
+    slot._stage_titles = [str(t) for t in titles]
+    descriptions = raw.get("stage_descriptions")
+    if isinstance(descriptions, list):
+        slot._stage_descriptions = [
+            [str(b) for b in bullets] if isinstance(bullets, list) else []
+            for bullets in descriptions
+        ]
+    goal = raw.get("goal")
+    if isinstance(goal, str):
+        slot._plan_goal = goal
+
+    snapshot = raw.get("tracker")
+    if not isinstance(snapshot, dict) or not snapshot:
+        return None
+    snapshot = _confine_restored_result_paths(snapshot, slot.key)
+    try:
+        tracker = OrchestrationTracker.from_snapshot(snapshot)
+    except Exception:
+        logger.warning("Plan tracker restore failed for slot %s", slot.key, exc_info=True)
+        return None
+    # A plan that never recorded a round or a result was armed but not started:
+    # there is no interrupted run to resume, so publish nothing and let the
+    # transcript's own plan buttons drive the first Go.
+    if not tracker.started:
+        return None
+    slot._orch_tracker = tracker
+    resume = tracker.resume_stage()
+    if resume > len(slot._stage_titles):
+        # Every stage has a result: finished, nothing to resume. Save-side
+        # already refuses to write this, so it only arrives from an older or
+        # hand-edited record.
+        return None
+    return resume
+
+
+def _confine_restored_result_paths(snapshot: dict, slot_key: str) -> dict:
+    """Drop any stage-result path that is not the file the writer would have made.
+
+    A stage-result path is not free-form data even though it round-trips as a
+    string. ``_write_stage_result`` produces exactly
+    ``<config_dir>/sessions/<slot>/stage_<n>_result.md``, and the restored value is
+    later opened by ``_read_previous_results``, whose contents are inlined into the
+    NEXT stage's prompt. Validating only "non-empty string" therefore left the
+    transcript's own metadata line able to name any readable file on the host and
+    have its bytes handed to the model (GPT finding). The history JSONL is a plain
+    file, so this is reachable by a hand-edit or by anything that can write it.
+
+    Allow-listed by exact expected filename rather than screened by a denylist: the
+    writer's output is fully determined by the slot key and the stage number, so
+    there is nothing legitimate outside that set. A rejected entry is dropped,
+    which leaves its stage absent and re-runs it -- the same safe direction as
+    every other rejection in ``from_snapshot``.
+    """
+    results = snapshot.get("stage_results")
+    if not isinstance(results, dict) or not results:
+        return snapshot
+    session_dir = config_dir() / "sessions" / slot_key
+    kept: dict = {}
+    for key, value in results.items():
+        if not isinstance(value, str):
+            continue
+        try:
+            stage = int(key)
+        except (TypeError, ValueError):
+            continue
+        # Compared as STRINGS against the writer's own rendering. ``Path``
+        # equality would fold different spellings of one location together, and
+        # for an allowlist the only tolerable error is being too strict.
+        if value == str(session_dir / f"stage_{stage}_result.md"):
+            kept[key] = value
+        else:
+            logger.warning(
+                "Plan restore for slot %s dropped an unexpected stage %s result "
+                "path; the stage will be re-run",
+                slot_key,
+                stage,
+            )
+    confined = dict(snapshot)
+    confined["stage_results"] = kept
+    return confined
+
+
+def _append_plan_resume_offer(slot: _ChatSlot, resume_stage: int) -> None:
+    """Append the restart-resume offer at the transcript tail.
+
+    Mirrors the interrupted-relay notice: ``broadcast=False`` (no clients exist at
+    boot) and the caller re-arms ``_dirty`` so the row is flushed. The
+    ``[OPTION: ...]`` line renders the same plan controls the stage-gate messages
+    use, and ``api_chat_plan_action`` re-enters ``_stage_loop`` from the restored
+    tracker -- which resumes AT the interrupted stage rather than after it.
+    """
+    for m in slot.messages[-3:]:
+        if _PLAN_RESUME_MARKER in str(m.get("content", "")):
+            return
+    titles = getattr(slot, "_stage_titles", []) or []
+    total = len(titles)
+    title = titles[resume_stage - 1] if 0 <= resume_stage - 1 < total else ""
+    label = f"Stage {resume_stage}: {title}" if title else f"Stage {resume_stage}"
+    body = (
+        f"⏸️ This plan {_PLAN_RESUME_MARKER} — {label} of {total} did not finish."
+        f"\n\nResume from {label}?"
+        "\n\n[OPTION: Go | Go All | Cancel]"
+    )
+    # Redacted at the emit site, like every other row the orchestrator writes (the
+    # stage separator, the injected context, the halt notices). The stage title
+    # interpolated above is MODEL-authored text that has round-tripped through the
+    # metadata line, and the load path redacts message CONTENT while deferring meta
+    # to its emit sites -- so without this the one new row in this change would be
+    # the only orchestrator output that can print a credential (GPT finding).
+    body, _ = redact_exfiltration_urls(body)
+    body, _ = redact_credentials(body)
+    slot.append("assistant", body, "msg msg-a", broadcast=False)
 
 
 def save_all_slots_to_history(state: DashboardState) -> None:
@@ -978,6 +1171,7 @@ def _rehydrate_slot_from_history(
         # ``_run_chat`` chokepoint (keyed on ``executor``, not ``is_remote``) refuse
         # the send with a message the user can act on, rather than run local.
         _relay_was_in_flight = False
+        _plan_resume_stage: int | None = None
         _executor_meta = meta.get("executor")
         _instance_meta = meta.get("instance_id")
         _remote_slot_meta = meta.get("remote_slot")
@@ -996,6 +1190,10 @@ def _rehydrate_slot_from_history(
                 _relay_was_in_flight = bool(meta.get("relay_in_flight"))
         if meta.get("mode") and _member_identity is None:
             slot.mode = meta["mode"]
+        # After ``mode``, which _plan_state_for_save gates on. Deferred like the
+        # relay notice below: the offer row belongs at the transcript TAIL, so
+        # only the state is restored here.
+        _plan_resume_stage = _restore_plan_state(slot, meta.get("plan"))
         if meta.get("created_by"):
             # Creator attribution restored so the member ownership boundary in
             # session-control authorization survives a restart: without it every
@@ -1210,6 +1408,12 @@ def _rehydrate_slot_from_history(
                 "msg msg-err",
                 broadcast=False,
             )
+            slot._dirty = True
+        if _plan_resume_stage is not None:
+            # The plan was mid-flight when the process died. Offer the resume
+            # rather than either silently continuing (unattended execution the
+            # user is not watching) or dropping the run.
+            _append_plan_resume_offer(slot, _plan_resume_stage)
             slot._dirty = True
         logger.info("Rehydrated session %s (%s) from history", slot_name, slot.title)
         return slot
@@ -1504,6 +1708,9 @@ def _apply_recent_session(
         slot.project = meta["project"]
     if meta.get("mode") and _member_identity is None:
         slot.mode = meta["mode"]
+    # Same deferral as _rehydrate_slot_from_history: state here, offer row at
+    # the tail once the window is loaded.
+    _plan_resume_stage = _restore_plan_state(slot, meta.get("plan"))
     if meta.get("created_by"):
         # Same rehydration as _rehydrate_slot_from_history: without it a
         # member-created worker restored through the recent-session path
@@ -1618,6 +1825,9 @@ def _apply_recent_session(
     # _disk_older_count above) are the frozen prefix saves never rewrite.
     slot._disk_window_len = len(slot.messages)
     slot._dirty = False
+    if _plan_resume_stage is not None:
+        _append_plan_resume_offer(slot, _plan_resume_stage)
+        slot._dirty = True
     logger.info("Restored session %s (%s)", slot_name, slot.title)
 
 
@@ -2743,6 +2953,9 @@ def _save_slot_to_history(
                     "tags": list(slot.tags),
                     "pinned": bool(slot.pinned),
                     "mode": slot.mode or "",
+                    # Clearable, like ``mode``: an empty dict is "no live plan"
+                    # and must overwrite a stale one on disk.
+                    "plan": _plan_state_for_save(slot),
                     "artifact": slot._artifact or "",
                     "reasoning_effort": slot.reasoning_effort or "",
                     "color_index": slot.color_index,
@@ -3070,6 +3283,15 @@ def _save_slot_to_history(
             meta_line["autocompact_pct"] = slot.autocompact_pct
             if slot.mode:
                 meta_line["mode"] = slot.mode
+            # Written only when a live plan exists. ``plan`` is slot-owned, so on
+            # this path -- a from-scratch rebuild plus carry_unowned_metadata --
+            # an ABSENT field already clears a stale record; an unconditional
+            # ``{}`` would just add a dead key to every transcript. The
+            # empty-window merge above must still write it unconditionally,
+            # because a merge cannot delete a key.
+            _plan_meta = _plan_state_for_save(slot)
+            if _plan_meta:
+                meta_line["plan"] = _plan_meta
             if slot.workspace and slot.workspace != "default":
                 meta_line["workspace"] = slot.workspace
             if slot.project:

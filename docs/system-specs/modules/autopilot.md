@@ -29,7 +29,7 @@ is Autopilot") so the model recognizes user references to *autopilot* /
 
 | File | Role |
 |------|------|
-| `dashboard/chat_orchestrator.py` | `_stage_loop` (the stage driver), `_build_stage_context`, `_capture_stage_result`, `api_chat_plan_action` |
+| `dashboard/chat_orchestrator.py` | `_stage_loop` (the stage driver), `_build_stage_context`, `_collect_stage_result_parts` + `_write_stage_result`, `api_chat_plan_action` |
 | `context_management.py` | `OrchestrationTracker`, plan-format validation (`validate_plan_format`, `looks_like_plan`, `ensure_go_all_option`, `strip_plan_markers`, `rephrase_plan`, `extract_plan_metadata`), and all size caps |
 | `dashboard/chat_runner.py` | `_run_chat` (one LLM turn) plus the end-of-turn plan detector that arms the gate |
 | `dashboard/chat_title.py` | `_reset_auto_run_for_new_plan`, `_extract_and_redact_plan_metadata`, `_rephrase_plan_lite` |
@@ -171,27 +171,52 @@ approvals live on separate endpoints an iframe cannot reach.
 ## Execution: the stage loop
 
 `_stage_loop` (`chat_orchestrator.py:140`) owns stage boundaries in Python, not
-in the prompt. It creates the tracker if absent (timeout from
-`orchestrator.stage_timeout_seconds`), resumes at `tracker.current_stage` when
-rounds already exist, and for each stage index:
+in the prompt. It creates the tracker if absent, loads the budgets
+(`orchestrator.stage_timeout_seconds` and `orchestrator.max_plan_duration_seconds`)
+whenever `tracker.budgets_unset` says this tracker has never had them applied,
+resumes at `tracker.current_stage` when rounds already exist, and for each stage
+index:
+
+The load is gated on the TRACKER, not on whether this loop created it. Gating on
+`tracker is None` meant a tracker the loop did not build — one rebuilt by
+`from_snapshot` after a restart, or created lazily by `slack/gateway.py` when a
+subagent result landed — ran the whole plan on constructor defaults, with the plan
+watchdog sitting at `0` (disabled). A tracker constructed WITH an explicit budget
+answers `budgets_unset == False`, so a paused plan's later Go still pays for no
+load, and `mark_budgets_loaded()` is recorded even when the load raised so one bad
+config read cannot become one per stage-loop entry.
 
 1. Break if `_orchestration_stopped(slot, tracker)` — see
    [Stop and Cancel](#stop-and-cancel) for why both flags are read.
 2. **Clamp**: break if `stage_idx >= slot._plan_stage_count`. `total` is
    captured once when the range is built, so a plan that shrank mid-run would
    otherwise emit a phantom "Stage N of M" with N > M.
-3. Check `tracker.is_stage_timed_out()` **before** recording the round, because
+3. **Whole-plan watchdog.** Break if `tracker.is_plan_timed_out()`
+   (`orchestrator.max_plan_duration_seconds`, default 2 h), clearing `_auto_run`
+   and logging `auto_run_timeout` / `plan_duration_exceeded`. Checked at the
+   boundary rather than mid-turn: the running stage has its own ceiling, and
+   cutting between stages leaves every finished stage captured and resumable.
+   `tracker.plan_warning_due()` posts one notice — latched in the tracker — once
+   the run passes `PLAN_WARN_FRACTION` (75%) of that budget.
+4. Check `tracker.is_stage_timed_out()` **before** recording the round, because
    `record_round` restarts the stage clock. On timeout: clear `_auto_run`, post
    the elapsed notice, log `auto_run_timeout`, break.
-4. `tracker.record_round(stage_num)` and append a `───── Stage N: Title ─────`
+5. **Escalation cap on entry.** Break if `tracker.is_force_failed(stage_num)`.
+   Deliberately the escalation cap and not the round cap: the loop starts at the
+   stage after the highest one with a recorded round, so the stage about to be
+   entered always has zero rounds and a pre-entry round check would be dead code.
+   Escalations survive a rehydration whole (while the interrupted stage's rounds
+   are dropped so it re-runs), so this is what stops the cap being laundered by
+   restarting the gateway.
+6. `tracker.record_round(stage_num)` and append a `───── Stage N: Title ─────`
    separator (class `stage-sep`).
-5. `_build_stage_context` composes the goal, a `status_summary` checklist
+7. `_build_stage_context` composes the goal, a `status_summary` checklist
    (completed / execute-now / pending), previous stage results, the current
    stage's title and bullets, and an explicit "execute Stage N of M now"
    instruction. It is appended as a hidden user message (`auto-go` class) and
    passed to `_run_chat`. An exception from `_run_chat` clears `_auto_run`,
    posts a stage-error notice, logs `auto_run_stage_error`, and breaks.
-6. **Wait for the stage's sub-agents.** Polls
+8. **Wait for the stage's sub-agents.** Polls
    `state.subagents.running_agents_for("dashboard:<slot>")` every 2s, up to 150
    rounds (5 minutes), broadcasting a `chat_status` count every 10 polls. This
    is **fail-closed**: a missing manager, or `running_agents_for` returning
@@ -199,13 +224,25 @@ rounds already exist, and for each stage index:
    `auto_run_subagent_check_failed` SEL event rather than silently skipping
    verification. Exhausting the 150 rounds stops auto-run with
    `auto_run_subagent_timeout`.
-7. `_capture_stage_result` concatenates the assistant messages back to this
-   stage's separator and writes
-   `~/.kiro/crew/sessions/<slot>/stage_<n>_result.md`; the path is recorded on
-   the tracker. Redaction is re-applied here even though both upstream sources
-   are already clean, because this writes a NEW file outside the history log's
-   own redaction pass (redaction is idempotent, so the common case is a no-op).
-8. If not `auto_run` and another stage remains: post
+9. **Capture the stage result**, split across the thread boundary.
+   `_collect_stage_result_parts` walks the assistant messages back to this
+   stage's separator **on the loop**, because `slot.messages` is live state the
+   loop mutates; it returns an immutable tuple of raw strings, which
+   `_write_stage_result` then redacts and writes to
+   `~/.kiro/crew/sessions/<slot>/stage_<n>_result.md` **on a worker**. The path
+   is recorded on the tracker. Redaction is re-applied here even though both
+   upstream sources are already clean, because
+   this writes a NEW file outside the history log's own redaction pass
+   (redaction is idempotent, so the common case is a no-op).
+10. **Round cap after the wave.** Break if the stage has spent
+    `MAX_STAGE_ROUNDS`, clearing `_auto_run` and logging `auto_run_round_cap`
+    with `stage_force_failed` (escalations also exhausted — terminal) or
+    `stage_round_cap` (send guidance to continue). This is the gate that
+    actually fires: the loop records one round per stage entry, and the rest are
+    recorded against `tracker.current_stage` by `_subagent_done` as each spawn
+    wave finishes. Placed **after** the capture so a stage that genuinely
+    finished keeps its result on disk and the resume pointer moves past it.
+11. If not `auto_run` and another stage remains: post
    `✅ Stage N complete. Click **Go** to proceed to …` plus a fresh
    `[OPTION: Go | Go All | Cancel]`, mark the loop paused, and return. The
    user's next Go re-enters `_stage_loop`.
@@ -239,8 +276,8 @@ cannot talk its way past.
 | Limit | Value | Scope | Effect |
 |-------|-------|-------|--------|
 | `MAX_TASK_FAILURES` | 3 | per `task_key` (first 80 chars of the task) | System text: must ask the user for guidance before retrying |
-| `MAX_STAGE_ROUNDS` | 3 | per stage | System text: must ask the user for guidance before spawning more |
-| `MAX_STAGE_ESCALATIONS` | 2 | per stage | `is_force_failed()` becomes true: must stop and report, no retry |
+| `MAX_STAGE_ROUNDS` | 3 | per stage | Slack: system text to ask for guidance. Dashboard: `_stage_loop` halts the plan after the stage's wave (`auto_run_round_cap`) |
+| `MAX_STAGE_ESCALATIONS` | 2 | per stage | `is_force_failed()` becomes true: must stop and report, no retry. Dashboard: `_stage_loop` refuses to enter such a stage at all |
 
 Sub-agent outcomes feed the tracker from `slack/gateway.py`'s `_subagent_done`
 (`gateway.py:3586`), which resolves the tracker from the parent's **dashboard
@@ -303,6 +340,7 @@ the wrong trade.
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `orchestrator.stage_timeout_seconds` | `1800` | Wall-clock budget per stage before auto-run stops. `0` disables the check. |
+| `orchestrator.max_plan_duration_seconds` | `7200` | Wall-clock budget for the WHOLE plan, checked at each stage boundary, with one warning at 75%. `0` disables the check. |
 | `agent.conductor_skill` | `false` | Emits the always-on delegation skill. Independent of Autopilot: it changes routing knowledge, not the prompt. |
 
 Frontend-side, `defaultAutopilot` in the browser-local chat config
@@ -359,12 +397,32 @@ however long the plan runs.
 
 ## Limitations
 
-- **Plan progress is not persisted.** `_orch_tracker`, `_stage_titles`,
-  `_plan_goal`, `_stage_descriptions`, and `_auto_run` are in-memory `_ChatSlot`
-  attributes and are absent from both `to_dict()` and the persisted history meta
-  line (only `mode` is written, `chat_persistence.py:1398`), so a gateway
-  restart or crash loses stage position and the plan must be re-approved. The
-  `stage_*_result.md` files on disk survive, but nothing reloads them.
+- **Plan progress survives a restart, but is re-offered rather than resumed.**
+  The slot save writes a slot-owned `plan` metadata field
+  (`_plan_state_for_save`): the goal, stage titles and bullets, whether Go All
+  was chosen, and the tracker's `snapshot()` — its round ledger, escalation
+  ledger, and per-stage result paths. Both rehydration paths read it back
+  (`_restore_plan_state`) and an unfinished plan appends one
+  `⏸️ … interrupted when the gateway restarted` row carrying the usual
+  `[OPTION: Go | Go All | Cancel]`, so the user's Go re-enters `_stage_loop`.
+  Three deliberate choices in that record:
+  - `_auto_run` is **not** re-armed from the stored value. A restart must not
+    silently resume unattended execution; the stored flag only tells the offer
+    that Go All had been chosen.
+  - `resume_stage()` is derived from RECORDED RESULTS, so the interrupted stage
+    re-runs rather than being skipped. `from_snapshot` drops that stage's rounds
+    for the same reason (`_stage_loop` derives its start index from
+    `current_stage`) while restoring escalations whole.
+  - **Every entry in the record is validated, and a rejected entry re-runs its
+    stage.** Because `resume_stage()` reads the mere PRESENCE of a stage key as
+    "this stage finished", a result value must be a non-empty string — coercing
+    with `str()` accepted `null`, numbers and objects alike, so a corrupted or
+    hand-edited record made a resumed plan step over a stage that never ran.
+    Counters must be non-negative integers (`bool` excluded, since a JSON `true`
+    is a malformed record rather than a count of one).
+  - A plan that completed, was cancelled, or whose tracker is stopped is not
+    written at all — `plan` is in `SLOT_OWNED_META_KEYS`, so absence clears the
+    record and a finished plan is never re-offered.
 - Mode cannot be switched while the slot is running: `api_chat_slot_mode`
   returns `409`.
 - Sub-agent wait is capped at 5 minutes per stage; a longer fan-out stops

@@ -632,9 +632,10 @@ async def test_a_round_recorded_before_loop_entry_does_skip_a_stage(
 
     A tracker that already carries a round at loop ENTRY makes ``start_idx``
     non-zero and stage 1 is skipped. That is the resume path: ``_orch_tracker``
-    is already set, so nothing is published, ``_bootstrapping`` is False and no
-    config load runs at all. Keeping this here is what stops the test above from
-    reading as "record_round does nothing".
+    is already set, so nothing is published, and because that tracker already
+    carries its budgets (``budgets_unset`` is False) no config load runs at all.
+    Keeping this here is what stops the test above from reading as "record_round
+    does nothing".
     """
     threads: list[int] = []
     _record_config_loads(monkeypatch, threads)
@@ -654,7 +655,12 @@ async def test_a_round_recorded_before_loop_entry_does_skip_a_stage(
     slot._auto_run = True
     state = _stop_capable_state(slot)
 
-    resumed = OrchestrationTracker()
+    # Budgets passed explicitly, because that is what an in-process resume
+    # actually holds: the FIRST loop entry loaded them onto this same object, so
+    # entry two owes nothing. A tracker built with no budgets at all is the
+    # restart-resume shape instead, and it does owe one load -- see
+    # test_plan_duration_watchdog's restored-tracker case.
+    resumed = OrchestrationTracker(stage_timeout_seconds=1800)
     resumed.record_round(resumed.current_stage)
     slot._orch_tracker = resumed
 
