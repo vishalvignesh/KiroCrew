@@ -1775,7 +1775,23 @@ class TestTheMdNotebookBackendSeesItsOwnStateLeaves:
 
         return set(sandbox.md_notebook_backend_visible_paths())
 
-    def _spawn_and_capture_visible(self, bmod, tmp_path, monkeypatch, app_name):
+    @staticmethod
+    def _mark_builtin_owned(app_name):
+        """Rewrite the installed record so the real ownership predicate sees first-party
+        code. ``register_builtin_apps`` writes ``source``/``origin`` == "builtin"; this
+        reproduces that on disk so ``builtin_owns_installed`` -- the gate the carve-out
+        now trusts -- returns True, without depending on the shipped builtin manifest."""
+        from dataclasses import replace
+
+        from kiro_crew.apps import manager
+
+        existing = manager._read_installed(app_name)
+        assert existing is not None, f"{app_name} was not installed"
+        manager._write_installed(app_name, replace(existing, source="builtin", origin="builtin"))
+
+    def _spawn_and_capture_visible(
+        self, bmod, tmp_path, monkeypatch, app_name, builtin_owned=False
+    ):
         seen: dict = {}
 
         def _spy_wrap(argv, **kwargs):
@@ -1801,6 +1817,8 @@ class TestTheMdNotebookBackendSeesItsOwnStateLeaves:
         )
         (src / "server.py").write_text("import time\ntime.sleep(30)\n")
         install_app(src)
+        if builtin_owned:
+            self._mark_builtin_owned(app_name)
         bmod.start_app_backend(app_name)
         return seen
 
@@ -1809,13 +1827,35 @@ class TestTheMdNotebookBackendSeesItsOwnStateLeaves:
     ):
         import kiro_crew.apps.backend as bmod
 
-        seen = self._spawn_and_capture_visible(bmod, tmp_path, monkeypatch, "md-notebook")
+        seen = self._spawn_and_capture_visible(
+            bmod, tmp_path, monkeypatch, "md-notebook", builtin_owned=True
+        )
 
         visible = set(seen.get("visible") or ())
         missing = self._md_notebook_leaves() - visible
         assert not missing, (
             "the md-notebook backend spawn did not expose its own state leaves, so the "
             f"atomic rename onto vaults.json stays EPERM-denied (missing {missing!r})"
+        )
+
+    def test_a_shadowing_user_app_gets_none_of_the_leaves(self, app_env, tmp_path, monkeypatch):
+        """Fail-closed boundary: "md-notebook" is NOT a reserved name, so a user could
+        install an app under it. When that install lands before builtin registration,
+        registration stands down and the user's app becomes what start_app_backend
+        spawns. That process must NOT inherit read+write to the real Notes PAT and vault
+        registry. The carve-out gates on builtin ownership, so a spawn whose installed
+        record is user-owned -- even under the name "md-notebook" -- gets no leaves."""
+        import kiro_crew.apps.backend as bmod
+
+        seen = self._spawn_and_capture_visible(
+            bmod, tmp_path, monkeypatch, "md-notebook", builtin_owned=False
+        )
+
+        visible = set(seen.get("visible") or ())
+        leaked = self._md_notebook_leaves() & visible
+        assert not leaked, (
+            "a user-installed app shadowing the md-notebook name was handed the real "
+            f"Notes state leaves (including the GitHub PAT): {leaked!r}"
         )
 
     def test_another_app_gets_none_of_the_leaves(self, app_env, tmp_path, monkeypatch):

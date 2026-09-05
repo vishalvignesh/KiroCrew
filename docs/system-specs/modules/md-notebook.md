@@ -61,6 +61,15 @@ process, read+write. Unlike the policy cache, they are NOT sealed read-only, bec
 rename target has to be writable. Every other sandboxed process keeps the mask, and the
 agent-file-tool gate is untouched.
 
+The carve-out is the first `extra_visible_dirs` caller to grant WRITE, so its gate fails
+closed. The app id `md-notebook` is not a reserved name, so a user could install an app
+under it; if that install lands before builtin registration, registration stands down and
+the user's app becomes what `start_app_backend("md-notebook")` spawns. Handing that
+process write access to the real PAT and vault registry would leak a live GitHub token, so
+the carve-out gates on `manager.builtin_owns_installed("md-notebook")` in addition to the
+name. That predicate returns True only when the active installed record was written by
+first-party builtin registration, so a shadowing user app never inherits the leaves.
+
 ## Routes
 
 The gateway proxy preserves the `/api/` prefix, so the backend sees exactly the paths the

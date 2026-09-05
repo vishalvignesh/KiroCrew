@@ -31,7 +31,12 @@ from kiro_crew.apps.execution import (
     shipped_builtin_module_path,
 )
 from kiro_crew.apps.interpreter import resolve_app_python, venv_python_path
-from kiro_crew.apps.manager import app_dir, get_app_manifest, list_apps
+from kiro_crew.apps.manager import (
+    app_dir,
+    builtin_owns_installed,
+    get_app_manifest,
+    list_apps,
+)
 from kiro_crew.apps.registry import minimal_env
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
@@ -1149,7 +1154,16 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
     # target has to be writable. The agent-file-tool gate and every other process are
     # unaffected: this widens nothing beyond this one child. The app-name literal matches
     # ``apps/builtins/md_notebook/app.json``.
-    if app_name == "md-notebook":
+    #
+    # The name alone is NOT a sufficient gate: "md-notebook" is not a reserved app name, so
+    # a user could install an app under it. When that install lands before builtin
+    # registration, ``register_builtin_apps()`` stands down and leaves the user's record in
+    # place, and ``start_app_backend("md-notebook")`` would then spawn the user's app. Since
+    # this is the first ``extra_visible_dirs`` caller to grant WRITE (to the real Notes PAT
+    # and vault registry), the gate must fail closed: ``builtin_owns_installed`` returns True
+    # only when the active installed record for the name was written by first-party builtin
+    # registration, so a shadowing user app never inherits read+write to those leaves.
+    if app_name == "md-notebook" and builtin_owns_installed("md-notebook"):
         _visible = _visible + md_notebook_backend_visible_paths()
     sandboxed_cmd, cleanup_path = wrap_argv(cmd, mode="standard", extra_visible_dirs=_visible)
     if _cache_visible and list(sandboxed_cmd) == list(cmd):
