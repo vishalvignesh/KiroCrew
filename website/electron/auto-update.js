@@ -106,8 +106,23 @@ const CHECK_COMMAND_MAX_CHARS = 512;
  * metadata — the test-harness seam, mirroring `KIROCREW_UPDATE_FEED`, and
  * honored ONLY on an unpackaged build: in a packaged app one env var in the
  * launch environment would otherwise name the file whose body we execute), then
- * `<resourcesPath>/EXTERNALLY-MANAGED`. I/O-bearing and fully injectable, like
- * resolveLinuxInstall above.
+ * the BAKED marker `<app code>/EXTERNALLY-MANAGED` (inside app.asar, next to
+ * this file — placed there at build time by `packaging/build-desktop.sh` when
+ * `KIROCREW_MANAGED_INSTALL_MARKER` names one), then the LOOSE marker
+ * `<resourcesPath>/EXTERNALLY-MANAGED` a repackager drops beside the app.
+ * I/O-bearing and fully injectable, like resolveLinuxInstall above.
+ *
+ * The two on-disk shapes differ in WHO put the file there, which is what its
+ * authority rests on. The loose marker is a post-build affordance for a distro
+ * packager, so it is gated on provenance (below). The baked marker is part of
+ * the application's own code: it ships in the same archive as main.js and this
+ * module, so anyone positioned to rewrite it is already positioned to rewrite
+ * the code that reads it, and no ownership probe can add anything to that. It
+ * is therefore trusted as code is trusted — on every platform, Windows
+ * included — and it outranks a loose marker when both exist, because a
+ * build-time declaration by the edition that produced the binary is a stronger
+ * statement than a file dropped next to it afterwards. On macOS the baked
+ * marker is additionally sealed by codesign for free.
  *
  * The marker body is optional JSON `{managedBy, updateCommand, checkCommand}`:
  * `managedBy` names the owning system for the About panel, `updateCommand` is
@@ -121,19 +136,22 @@ const CHECK_COMMAND_MAX_CHARS = 512;
  * self-updating. Entries are `lstat`ed and only regular files are read, so a
  * symlink can never route this startup-path read into a FIFO or device.
  *
- * INTEGRITY: the metadata is only parsed when neither the marker nor its
- * directory is OWNED by this euid or writable by group/other (see
+ * INTEGRITY (loose marker only): the metadata is only parsed when neither the
+ * marker nor its directory is OWNED by this euid or writable by group/other (see
  * canRewriteMarker) — `updateCommand`/`checkCommand` are SHELLED, so a marker
  * anything running as this user could rewrite is a marker that names arbitrary
  * code to run. A rewritable marker still means MANAGED, just with no metadata:
  * the same degenerate shape as an empty body, which leaves the updater off and
- * nothing to execute. Windows always takes that answer (no POSIX owner to read).
+ * nothing to execute. Windows always takes that answer for a loose marker (no
+ * POSIX owner to read); a baked marker is not probed on any platform.
  *
  * @param {object} [o]
  * @param {object} [o.env=process.env]
  * @param {string} [o.resourcesPath=process.resourcesPath]
  * @param {boolean} [o.isPackaged]  packaged app? gates the env-var seam off
  * @param {(p:string)=>boolean} [o.probeMarkerRewritable=canRewriteMarker]
+ * @param {string} [o.bakedMarkerPath]  where the in-code marker lives; defaults
+ *   to `EXTERNALLY-MANAGED` beside this module (inside app.asar when packaged)
  * @returns {{managedBy:string, updateCommand:string, checkCommand:string}|null} null when not managed
  */
 function readExternallyManaged({
@@ -154,9 +172,16 @@ function readExternallyManaged({
   // Marker-integrity probe, injected for the same reason as the other probes in
   // this module: assertable without a real read-only install directory.
   probeMarkerRewritable = canRewriteMarker,
+  // The in-code marker. `__dirname` is inside app.asar in a packaged build
+  // (Electron's fs shim reads through the archive), and the module directory
+  // in a dev checkout, where the file simply does not exist.
+  bakedMarkerPath = require("path").join(__dirname, EXTERNALLY_MANAGED_MARKER),
 } = {}) {
   let raw = null;
   let markerPath = "";
+  // Which shape was found. Only a LOOSE marker is subject to the provenance
+  // probe below; a baked one is code (see the doc comment).
+  let loose = false;
   try {
     const fs = require("fs");
     const path = require("path");
@@ -184,22 +209,32 @@ function readExternallyManaged({
     if (override) {
       // A value that names a marker file reads it; any other non-empty value
       // (including a dangling path) marks the install managed with no metadata.
+      // Treated like a loose marker: the harness is exercising that path.
       markerPath = override;
+      loose = true;
       raw = readMarkerAt(override);
       if (raw === null) raw = "";
     } else {
-      markerPath = path.join(resourcesPath || "", EXTERNALLY_MANAGED_MARKER);
-      raw = readMarkerAt(markerPath);
-      if (raw === null) return null;
+      // Baked first: a build-time declaration outranks a file dropped later.
+      markerPath = bakedMarkerPath || "";
+      raw = markerPath ? readMarkerAt(markerPath) : null;
+      if (raw === null) {
+        markerPath = path.join(resourcesPath || "", EXTERNALLY_MANAGED_MARKER);
+        loose = true;
+        raw = readMarkerAt(markerPath);
+        if (raw === null) return null;
+      }
     }
   } catch {
     // fs itself unavailable (non-node runtime): nothing to read, not managed.
     return null;
   }
-  // Integrity gate: a marker this process could rewrite carries no authority,
-  // so it is read as a bare marker (managed, no metadata). Deliberately BEFORE
-  // the parse, so no attacker-chosen string reaches the fields at all.
-  if (raw && probeMarkerRewritable(markerPath)) raw = "";
+  // Integrity gate: a LOOSE marker this process could rewrite carries no
+  // authority, so it is read as a bare marker (managed, no metadata).
+  // Deliberately BEFORE the parse, so no attacker-chosen string reaches the
+  // fields at all. A baked marker skips the probe: it is code, and its
+  // provenance is the application's own.
+  if (raw && loose && probeMarkerRewritable(markerPath)) raw = "";
   let managedBy = "";
   let updateCommand = "";
   let checkCommand = "";
@@ -256,8 +291,10 @@ function readExternallyManaged({
 // answer is only "no metadata", which is the historical bare-marker behavior.
 // Windows takes that answer UNCONDITIONALLY and by declaration: it has no POSIX
 // owner to read, and `access(W_OK)` there does not model ACLs, so there is no
-// honest verdict to give. A Windows install therefore never honors marker
-// commands; see docs/build/desktop-app.md.
+// honest verdict to give. A Windows install therefore never honors a LOOSE
+// marker's commands; a packager that needs them there bakes the marker into the
+// app at build time, where this probe does not apply (see readExternallyManaged
+// and docs/build/desktop-app.md).
 function canRewriteMarker(markerPath) {
   try {
     const fs = require("fs");
@@ -1025,10 +1062,12 @@ function initAutoUpdate(deps) {
     // commands.
     //
     // TRUST / HARDENING: reaching here means the marker's metadata already
-    // passed the integrity gate in readExternallyManaged — neither the marker nor
-    // its directory is owned by this euid or writable by group/other, so it is a
-    // genuine packager artifact rather than a file a prompt-injected agent shell
-    // could have planted. That gate is
+    // passed the provenance test in readExternallyManaged — either it is BAKED
+    // into the application's own code (the same archive as this module, so no
+    // write primitive reaches it that does not already reach main.js), or it is
+    // a LOOSE marker that neither this euid owns nor group/other can write, so
+    // it is a genuine packager artifact rather than a file a prompt-injected
+    // agent shell could have planted. That test is
     // what makes the commands trustworthy at all; the hardening below is about
     // the ENVIRONMENT they run in, not about the command string (see
     // runManagedCommand) — a narrowed system-only PATH so a planted shim on the

@@ -807,6 +807,47 @@ if [ "${SKIP_ELECTRON:-0}" = "1" ]; then
   exit 0
 fi
 
+# --- 3b. Baked EXTERNALLY-MANAGED marker (optional) --------------------------
+# An edition whose installs are owned by an external package manager (a Toolbox,
+# a corporate installer) declares that at BUILD time by naming its marker here.
+# The file is copied to $ELECTRON_DIR/EXTERNALLY-MANAGED, which package.json's
+# `files` list packs INTO app.asar next to main.js -- so the running app reads
+# it as its own code, on every platform, with no ownership probe (see
+# readExternallyManaged in website/electron/auto-update.js). A marker dropped
+# beside the app after the build (`<resources>/EXTERNALLY-MANAGED`) is the
+# repackager affordance and stays gated on file provenance; that gate refuses
+# every user-owned install and can never pass on Windows, which is why an
+# edition bakes instead of dropping.
+#
+# The copy is validated as the JSON object the reader accepts -- string fields
+# only, under the reader's 8 KiB read cap -- and the build FAILS on anything
+# else: the reader treats a malformed marker as "managed, nothing to run", so a
+# typo here would silently ship an app that can neither self-update nor be
+# updated from its About panel. Unset, any leftover from a previous local build
+# is removed so a stale declaration cannot ride along.
+rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED"
+if [ -n "${KIROCREW_MANAGED_INSTALL_MARKER:-}" ]; then
+  MARKER_SRC="$KIROCREW_MANAGED_INSTALL_MARKER"
+  test -f "$MARKER_SRC" || { echo "❌ KIROCREW_MANAGED_INSTALL_MARKER does not name a file: $MARKER_SRC" >&2; exit 1; }
+  node -e '
+    const fs = require("fs");
+    const [src] = process.argv.slice(1);
+    const buf = fs.readFileSync(src);
+    if (buf.length > 8192) { console.error(`marker is ${buf.length} bytes; the reader caps at 8192`); process.exit(1); }
+    let parsed;
+    try { parsed = JSON.parse(buf.toString("utf8")); } catch (e) { console.error(`marker is not JSON: ${e.message}`); process.exit(1); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) { console.error("marker must be a JSON object"); process.exit(1); }
+    const allowed = ["managedBy", "updateCommand", "checkCommand"];
+    for (const k of Object.keys(parsed)) {
+      if (!allowed.includes(k)) { console.error(`marker has unknown field "${k}" (allowed: ${allowed.join(", ")})`); process.exit(1); }
+      if (typeof parsed[k] !== "string") { console.error(`marker field "${k}" must be a string`); process.exit(1); }
+    }
+    if (!parsed.updateCommand) { console.error("marker has no updateCommand: it would disable updates without offering any"); process.exit(1); }
+  ' "$MARKER_SRC" || { echo "❌ KIROCREW_MANAGED_INSTALL_MARKER rejected: $MARKER_SRC" >&2; exit 1; }
+  cp "$MARKER_SRC" "$ELECTRON_DIR/EXTERNALLY-MANAGED"
+  log "Baking EXTERNALLY-MANAGED marker into the app from $MARKER_SRC"
+fi
+
 # --- 4. Package the desktop app with electron-builder -----------------------
 log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
 ( cd "$ELECTRON_DIR"
